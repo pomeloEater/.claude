@@ -1,0 +1,12 @@
+# 화이트리스트 방식: 기본은 모두 무시, 명시한 것만 추적
+*
+
+# 추적할 항목
+!.gitignore
+!README.md
+!skills/
+!skills/**
+
+# 외부에서 설치한 스킬 제외
+skills/qgis-*
+skills/code-prompt-coach
