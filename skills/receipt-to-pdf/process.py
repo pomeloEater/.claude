@@ -56,6 +56,66 @@ def otsu_threshold(arr: np.ndarray) -> int:
     return bt
 
 
+# ─── 가장 큰 연결 영역만 남기기 (다른 흰 종이/배경 제거) ───────
+def isolate_largest_blob(mask: np.ndarray, downscale: int = 8) -> np.ndarray:
+    """4-연결 컴포넌트 중 가장 큰 것만 남긴다.
+    속도를 위해 다운스케일된 마스크에서 iterative dilation으로 컴포넌트를 키우고,
+    가장 큰 컴포넌트의 위치만 원본 해상도로 복원해 마스킹한다."""
+    h, w = mask.shape
+    sh, sw = h // downscale, w // downscale
+    if sh < 4 or sw < 4:
+        return mask
+
+    # block-mean 다운샘플 + 50% 임계
+    cropped = mask[: sh * downscale, : sw * downscale]
+    small = cropped.reshape(sh, downscale, sw, downscale).mean(axis=(1, 3)) > 0.5
+    if not small.any():
+        return mask
+
+    visited = np.zeros_like(small)
+    best_size = 0
+    best_comp = None
+
+    while True:
+        candidates = small & ~visited
+        remaining = int(candidates.sum())
+        # 남은 흰 픽셀이 현재 최선보다 적으면 더 큰 블롭 불가능 → 종료
+        if remaining == 0 or remaining <= best_size:
+            break
+
+        ys, xs = np.where(candidates)
+        comp = np.zeros_like(small)
+        comp[ys[0], xs[0]] = True
+
+        # iterative 4-연결 dilation
+        prev_size = 0
+        while True:
+            d = comp.copy()
+            d[1:, :] |= comp[:-1, :]
+            d[:-1, :] |= comp[1:, :]
+            d[:, 1:] |= comp[:, :-1]
+            d[:, :-1] |= comp[:, 1:]
+            comp = d & small
+            sz = int(comp.sum())
+            if sz == prev_size:
+                break
+            prev_size = sz
+
+        if prev_size > best_size:
+            best_size = prev_size
+            best_comp = comp
+        visited |= comp
+
+    if best_comp is None:
+        return mask
+
+    # 원본 해상도로 복원
+    big = best_comp.repeat(downscale, axis=0).repeat(downscale, axis=1)
+    full = np.zeros_like(mask)
+    full[: big.shape[0], : big.shape[1]] = big
+    return mask & full
+
+
 # ─── bbox + 엣지 직선 피팅 → 4코너 ────────────────────────────
 def find_receipt_bbox(mask: np.ndarray, kernel: int = 80, ratio: float = 0.45):
     h, w = mask.shape
@@ -209,8 +269,25 @@ def enhance(img: Image.Image) -> Image.Image:
     return ImageEnhance.Contrast(ImageOps.autocontrast(g, cutoff=1)).enhance(1.4)
 
 
+def auto_rotate(img: Image.Image) -> Image.Image:
+    """영수증을 세로 방향으로 정렬한다.
+    - 영수증은 본질적으로 세로가 긴 직사각형 → W>H면 90° 회전
+    - 회전 방향(CW/CCW)은 헤더(상단)가 더 진한 쪽으로 결정 (휴리스틱 — 케이스에 따라 빗나갈 수 있음)
+    - 180° 뒤집힘은 OCR 없이는 안정적으로 감지 불가 → --flip 옵션으로 수동 지정"""
+    w, h = img.size
+    if w <= h:
+        return img
+
+    a_ccw = np.array(img.rotate(90, expand=True).convert("L"))
+    a_cw = np.array(img.rotate(-90, expand=True).convert("L"))
+    thr = float(a_ccw.mean()) * 0.7
+    top_ccw = int((a_ccw[: a_ccw.shape[0] // 3] < thr).sum())
+    top_cw = int((a_cw[: a_cw.shape[0] // 3] < thr).sum())
+    return img.rotate(90 if top_ccw >= top_cw else -90, expand=True)
+
+
 # ─── 영수증 1개 처리 ───────────────────────────────────────────
-def process_one(src_path: Path, points_dir: Path | None):
+def process_one(src_path: Path, points_dir: Path | None, flip: bool = False):
     img = Image.open(src_path)
     arr = np.array(img)
 
@@ -224,12 +301,16 @@ def process_one(src_path: Path, points_dir: Path | None):
         otsu = otsu_threshold(arr)
         bri = max(otsu + 10, 150)
         mask = paper_mask(arr, bri=bri, sat=70)
+        mask = isolate_largest_blob(mask)
         corners = find_corners_auto(mask)
 
     if corners is None:
         return None
     tl, tr, br, bl = corners
-    return enhance(warp(img, tl, tr, br, bl))
+    out = auto_rotate(enhance(warp(img, tl, tr, br, bl)))
+    if flip:
+        out = out.rotate(180, expand=True)
+    return out
 
 
 # ─── PPT 슬라이드 합성 ─────────────────────────────────────────
@@ -319,8 +400,12 @@ def main():
                     help="출력 파일 이름 (기본: input_dir 폴더명)")
     ap.add_argument("--points", type=Path, default=None,
                     help="빨간 점 마커 이미지 폴더")
+    ap.add_argument("--flip", default="",
+                    help="180° 뒤집을 파일 이름(쉼표 구분, stem 일치, 부분 매칭). "
+                         "예: --flip 094610,094719")
     ap.add_argument("--no-pptx", action="store_true")
     args = ap.parse_args()
+    flip_keys = [k.strip() for k in args.flip.split(",") if k.strip()]
 
     inp = args.input_dir.resolve()
     if not inp.is_dir():
@@ -354,13 +439,15 @@ def main():
     rect_files = []
     for fp in files:
         print(f"▶ {fp.name}")
-        result = process_one(fp, args.points)
+        do_flip = any(k in fp.stem for k in flip_keys)
+        result = process_one(fp, args.points, flip=do_flip)
         if result is None:
             print("  ⚠ 코너 감지 실패 — 건너뜀")
             continue
         out = rect_dir / f"{fp.stem}_rect.jpg"
         result.save(out, quality=95)
-        print(f"  ✓ {out.name} ({result.size[0]}x{result.size[1]})")
+        flip_tag = " [flipped]" if do_flip else ""
+        print(f"  ✓ {out.name} ({result.size[0]}x{result.size[1]}){flip_tag}")
         rect_files.append(out)
 
     if not rect_files:
